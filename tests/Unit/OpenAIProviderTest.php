@@ -265,4 +265,101 @@ final class OpenAIProviderTest extends TestCase
 
         $this->provider->chat([Message::user('Test')]);
     }
+
+    // -------------------------------------------------------------------------
+    // Batch embedding — single API call for array input
+    // -------------------------------------------------------------------------
+
+    public function testBatchEmbedMakesASingleApiCall(): void
+    {
+        $inputs = ['Hello', 'World', 'Foo'];
+
+        // Only ONE HTTP POST must be made for the whole batch
+        $this->mockHttpClient
+            ->expects($this->once())
+            ->method('post')
+            ->with(
+                '/embeddings',
+                $this->callback(fn ($payload) => $payload['input'] === $inputs),
+                $this->isType('array'),
+            )
+            ->willReturn([
+                'data'  => [
+                    ['embedding' => [0.1, 0.2], 'index' => 0],
+                    ['embedding' => [0.3, 0.4], 'index' => 1],
+                    ['embedding' => [0.5, 0.6], 'index' => 2],
+                ],
+                'model' => 'text-embedding-3-small',
+                'usage' => ['prompt_tokens' => 15],
+            ]);
+
+        $response = $this->provider->embed($inputs);
+
+        // embed() returns the first embedding (index 0) per ProviderInterface contract
+        $this->assertSame([0.1, 0.2], $response->getEmbedding());
+    }
+
+    // -------------------------------------------------------------------------
+    // parseBatchEmbeddingResponse — correct index mapping
+    // -------------------------------------------------------------------------
+
+    public function testParseBatchEmbeddingResponseReturnsCorrectlyIndexedResults(): void
+    {
+        $raw = [
+            'data'  => [
+                ['embedding' => [0.1, 0.2], 'index' => 0],
+                ['embedding' => [0.3, 0.4], 'index' => 1],
+            ],
+            'model' => 'text-embedding-3-small',
+            'usage' => ['prompt_tokens' => 10],
+        ];
+
+        $results = $this->provider->parseBatchEmbeddingResponse($raw, ['Hello', 'World']);
+
+        $this->assertCount(2, $results);
+        $this->assertSame([0.1, 0.2], $results[0]->getEmbedding());
+        $this->assertSame([0.3, 0.4], $results[1]->getEmbedding());
+    }
+
+    public function testParseBatchEmbeddingResponseSortsOutOfOrderIndices(): void
+    {
+        // OpenAI may return results in any order — we must sort by index field
+        $raw = [
+            'data'  => [
+                ['embedding' => [0.9, 0.8], 'index' => 1],
+                ['embedding' => [0.1, 0.2], 'index' => 0],
+            ],
+            'model' => 'text-embedding-3-small',
+            'usage' => ['prompt_tokens' => 10],
+        ];
+
+        $results = $this->provider->parseBatchEmbeddingResponse($raw);
+
+        $this->assertSame([0.1, 0.2], $results[0]->getEmbedding());
+        $this->assertSame([0.9, 0.8], $results[1]->getEmbedding());
+    }
+
+    // -------------------------------------------------------------------------
+    // Custom model for embeddings
+    // -------------------------------------------------------------------------
+
+    public function testEmbedUsesCustomModel(): void
+    {
+        $this->mockHttpClient
+            ->expects($this->once())
+            ->method('post')
+            ->with(
+                '/embeddings',
+                $this->callback(fn ($p) => $p['model'] === 'text-embedding-3-large'),
+                $this->isType('array'),
+            )
+            ->willReturn([
+                'data'  => [['embedding' => [0.5], 'index' => 0]],
+                'model' => 'text-embedding-3-large',
+                'usage' => ['prompt_tokens' => 3],
+            ]);
+
+        $this->provider->embed('hello', ['model' => 'text-embedding-3-large']);
+    }
 }
+

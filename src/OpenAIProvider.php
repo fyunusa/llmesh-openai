@@ -98,20 +98,41 @@ final class OpenAIProvider implements ProviderInterface
         return new \LLMesh\Core\Generators\StreamResponse($generator());
     }
 
+    /**
+     * Embed a single string or a batch of strings in a single API call.
+     *
+     * When `$input` is an array, a single request is made to the OpenAI
+     * /embeddings endpoint with all texts — OpenAI supports batch natively.
+     * The method always returns the embedding for index 0 to satisfy the
+     * `ProviderInterface::embed(): EmbeddingResponseInterface` contract.
+     *
+     * Use `EmbeddingGenerator::embedBatch()` (which calls `embed()` once per
+     * input) to obtain a correctly ordered `EmbeddingResponse[]`.
+     *
+     * Supported models: text-embedding-3-small, text-embedding-3-large,
+     *                   text-embedding-ada-002
+     *
+     * @param string|string[] $input  Text or array of texts to embed
+     * @param array           $options Provider options; `model` defaults to text-embedding-3-small
+     */
     public function embed(string|array $input, array $options = []): EmbeddingResponseInterface
     {
-        $model = $options['model'] ?? 'text-embedding-3-small';
+        $model   = $options['model'] ?? 'text-embedding-3-small';
         $payload = [
-            'model' => $model,
-            'input' => $input,
+            'model'           => $model,
+            'input'           => $input,
             'encoding_format' => $options['encoding_format'] ?? 'float',
         ];
 
-        $response = $this->httpClient->post(
-            '/embeddings',
-            $payload,
-            $this->getHeaders(),
-        );
+        try {
+            $response = $this->httpClient->post(
+                '/embeddings',
+                $payload,
+                $this->getHeaders(),
+            );
+        } catch (HttpException $e) {
+            $this->handleHttpException($e);
+        }
 
         return $this->parseEmbeddingResponse($response);
     }
@@ -274,30 +295,72 @@ final class OpenAIProvider implements ProviderInterface
     }
 
     /**
-     * Parse embedding response from OpenAI.
+     * Parse an embedding response from OpenAI into an `EmbeddingResponse`.
      *
-     * @param array $response
+     * Always returns the embedding at index 0.  When a batch request was made
+     * the caller is responsible for issuing separate `embed()` calls per input
+     * (via `EmbeddingGenerator::embedBatch()`) to obtain per-index results.
+     *
+     * @param  array $response Decoded OpenAI /embeddings response
      * @return EmbeddingResponseInterface
      */
     private function parseEmbeddingResponse(array $response): EmbeddingResponseInterface
     {
-        // Handle both single and batch embeddings
-        if (isset($response['data'][0])) {
-            $embedding = $response['data'][0]['embedding'];
-        } else {
-            // Single embedding case
-            $embedding = $response['embedding'] ?? [];
-        }
+        // OpenAI always returns data[] — sort by index to guarantee ordering
+        $dataItems = $response['data'] ?? [];
+        usort($dataItems, fn (array $a, array $b) => ($a['index'] ?? 0) <=> ($b['index'] ?? 0));
+
+        // Return the first (or only) embedding
+        $embedding = $dataItems[0]['embedding'] ?? ($response['embedding'] ?? []);
 
         return new \LLMesh\Core\Embeddings\EmbeddingResponse(
-            embedding: $embedding,
+            embedding:  $embedding,
             dimensions: count($embedding),
-            usage: new Usage(
-                inputTokens: $response['usage']['prompt_tokens'] ?? 0,
+            usage:      new Usage(
+                inputTokens:  $response['usage']['prompt_tokens'] ?? 0,
                 outputTokens: 0,
             ),
-            model: $response['model'] ?? $this->model,
+            model:      $response['model'] ?? $this->model,
         );
+    }
+
+    /**
+     * Parse a batch embedding response and return one `EmbeddingResponse` per input index.
+     *
+     * The returned array is sorted by the `index` field that OpenAI returns in
+     * each data object so caller index always matches input index.
+     *
+     * @param  array    $response Decoded OpenAI /embeddings response
+     * @param  string[] $inputs   Original inputs (used for count verification)
+     * @return \LLMesh\Core\Embeddings\EmbeddingResponse[]
+     */
+    public function parseBatchEmbeddingResponse(
+        array $response,
+        array $inputs = [],
+    ): array {
+        $dataItems = $response['data'] ?? [];
+
+        // Sort by the index field OpenAI includes in each data object
+        usort($dataItems, fn (array $a, array $b) => ($a['index'] ?? 0) <=> ($b['index'] ?? 0));
+
+        $totalUsage = new Usage(
+            inputTokens:  $response['usage']['prompt_tokens'] ?? 0,
+            outputTokens: 0,
+        );
+        $model = $response['model'] ?? $this->model;
+
+        $results = [];
+        foreach ($dataItems as $item) {
+            $embedding   = $item['embedding'] ?? [];
+            $results[]   = new \LLMesh\Core\Embeddings\EmbeddingResponse(
+                embedding:  $embedding,
+                dimensions: count($embedding),
+                usage:      $totalUsage,
+                model:      $model,
+            );
+        }
+
+        return $results;
     }
 
     /**
