@@ -13,13 +13,14 @@ use LLMesh\Core\Exceptions\HttpException;
 use LLMesh\Core\Exceptions\ProviderException;
 use LLMesh\Core\Exceptions\RateLimitException;
 use LLMesh\Core\Exceptions\TokenLimitException;
-use LLMesh\Core\Generators\TextResponse;
-use LLMesh\Core\Generators\Usage;
 use LLMesh\Core\Http\HttpClient;
 use LLMesh\Core\Http\HttpClientFactory;
 use LLMesh\Core\Config\ProviderConfig;
 use LLMesh\Core\Data\ChunkDelta;
 use LLMesh\Core\Data\ToolCall;
+use LLMesh\Core\Data\ProviderChatResponse;
+use LLMesh\Core\Data\ProviderEmbeddingResponse;
+use LLMesh\Core\Data\ProviderStream;
 
 /**
  * OpenAI provider for LLMesh.
@@ -28,7 +29,7 @@ use LLMesh\Core\Data\ToolCall;
  */
 final class OpenAIProvider implements ProviderInterface
 {
-    private HttpClient $httpClient;
+    private readonly HttpClient $resolvedClient;
 
     /**
      * @param string $apiKey OpenAI API key
@@ -42,23 +43,28 @@ final class OpenAIProvider implements ProviderInterface
         HttpClient|null $httpClient = null,
         private readonly ProviderConfig|null $config = null,
     ) {
-        $this->httpClient = $httpClient ?? HttpClientFactory::make();
-        $this->httpClient->setBaseUrl('https://api.openai.com/v1');
+        $this->resolvedClient = $httpClient ?? HttpClientFactory::make();
+        $this->resolvedClient->setBaseUrl('https://api.openai.com/v1');
     }
 
     public function chat(array $messages, array $options = []): ResponseInterface
     {
         try {
             $payload = $this->buildChatPayload($messages, $options);
-            $response = $this->httpClient->post(
+            $response = $this->resolvedClient->post(
                 '/chat/completions',
                 $payload,
                 $this->getHeaders(),
             );
 
-            return TextResponse::fromProviderResponse($response, function ($raw) {
-                return $this->parseChatResponse($raw);
-            });
+            $parsed = $this->parseChatResponse($response);
+            return new ProviderChatResponse(
+                text: $parsed['text'],
+                inputTokens: $parsed['usage']['input_tokens'],
+                outputTokens: $parsed['usage']['output_tokens'],
+                finishReason: $parsed['finishReason'],
+                raw: $response
+            );
         } catch (HttpException $e) {
             $this->handleHttpException($e);
         }
@@ -69,7 +75,7 @@ final class OpenAIProvider implements ProviderInterface
         $payload = $this->buildChatPayload($messages, array_merge($options, ['stream' => true]));
 
         $generator = function () use ($payload) {
-            $lines = $this->httpClient->stream(
+            $lines = $this->resolvedClient->stream(
                 '/chat/completions',
                 $payload,
                 $this->getHeaders(),
@@ -93,9 +99,7 @@ final class OpenAIProvider implements ProviderInterface
             }
         };
 
-        // Return a StreamResponse - we'll create this in core later
-        // For now, wrap the generator
-        return new \LLMesh\Core\Generators\StreamResponse($generator());
+        return new ProviderStream($generator());
     }
 
     /**
@@ -125,7 +129,7 @@ final class OpenAIProvider implements ProviderInterface
         ];
 
         try {
-            $response = $this->httpClient->post(
+            $response = $this->resolvedClient->post(
                 '/embeddings',
                 $payload,
                 $this->getHeaders(),
@@ -313,14 +317,10 @@ final class OpenAIProvider implements ProviderInterface
         // Return the first (or only) embedding
         $embedding = $dataItems[0]['embedding'] ?? ($response['embedding'] ?? []);
 
-        return new \LLMesh\Core\Embeddings\EmbeddingResponse(
+        return new ProviderEmbeddingResponse(
             embedding:  $embedding,
-            dimensions: count($embedding),
-            usage:      new Usage(
-                inputTokens:  $response['usage']['prompt_tokens'] ?? 0,
-                outputTokens: 0,
-            ),
-            model:      $response['model'] ?? $this->model,
+            inputTokens:  $response['usage']['prompt_tokens'] ?? 0,
+            outputTokens: 0,
         );
     }
 
@@ -332,7 +332,7 @@ final class OpenAIProvider implements ProviderInterface
      *
      * @param  array    $response Decoded OpenAI /embeddings response
      * @param  string[] $inputs   Original inputs (used for count verification)
-     * @return \LLMesh\Core\Embeddings\EmbeddingResponse[]
+     * @return ProviderEmbeddingResponse[]
      */
     public function parseBatchEmbeddingResponse(
         array $response,
@@ -343,20 +343,15 @@ final class OpenAIProvider implements ProviderInterface
         // Sort by the index field OpenAI includes in each data object
         usort($dataItems, fn (array $a, array $b) => ($a['index'] ?? 0) <=> ($b['index'] ?? 0));
 
-        $totalUsage = new Usage(
-            inputTokens:  $response['usage']['prompt_tokens'] ?? 0,
-            outputTokens: 0,
-        );
-        $model = $response['model'] ?? $this->model;
+        $inputTokens = $response['usage']['prompt_tokens'] ?? 0;
 
         $results = [];
         foreach ($dataItems as $item) {
             $embedding   = $item['embedding'] ?? [];
-            $results[]   = new \LLMesh\Core\Embeddings\EmbeddingResponse(
+            $results[]   = new ProviderEmbeddingResponse(
                 embedding:  $embedding,
-                dimensions: count($embedding),
-                usage:      $totalUsage,
-                model:      $model,
+                inputTokens:  $inputTokens,
+                outputTokens: 0,
             );
         }
 

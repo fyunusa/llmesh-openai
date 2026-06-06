@@ -361,5 +361,37 @@ final class OpenAIProviderTest extends TestCase
 
         $this->provider->embed('hello', ['model' => 'text-embedding-3-large']);
     }
+
+    public function testCanStreamChat(): void
+    {
+        $messages = [Message::user('Hello')];
+
+        $streamLines = [
+            'data: {"choices":[{"delta":{"content":"Hi"}}]}',
+            'data: {"choices":[{"delta":{"content":" there"}}]}',
+            'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}',
+            'data: [DONE]'
+        ];
+
+        $generatorHelper = function() use ($streamLines) {
+            foreach ($streamLines as $line) {
+                yield $line;
+            }
+        };
+
+        $this->mockHttpClient
+            ->expects($this->once())
+            ->method('stream')
+            ->willReturn($generatorHelper());
+
+        $stream = $this->provider->stream($messages);
+        $chunks = iterator_to_array($stream->getChunks());
+
+        $this->assertCount(3, $chunks);
+        $this->assertSame('Hi', $chunks[0]->text);
+        $this->assertSame(' there', $chunks[1]->text);
+        $this->assertNull($chunks[2]->text);
+        $this->assertSame('stop', $chunks[2]->finishReason);
+    }
 }
 
