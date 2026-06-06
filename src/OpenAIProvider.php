@@ -141,12 +141,35 @@ final class OpenAIProvider implements ProviderInterface
         return $this->parseEmbeddingResponse($response);
     }
 
+    public function embedBatch(array $inputs, array $options = []): array
+    {
+        $model   = $options['model'] ?? 'text-embedding-3-small';
+        $payload = [
+            'model'           => $model,
+            'input'           => $inputs,
+            'encoding_format' => $options['encoding_format'] ?? 'float',
+        ];
+
+        try {
+            $response = $this->resolvedClient->post(
+                '/embeddings',
+                $payload,
+                $this->getHeaders(),
+            );
+        } catch (HttpException $e) {
+            $this->handleHttpException($e);
+        }
+
+        return $this->parseBatchEmbeddingResponse($response, $inputs);
+    }
+
     public function supports(string $capability): bool
     {
         return match ($capability) {
             'streaming' => true,
             'tools' => true,
             'embeddings' => true,
+            'batch_embeddings' => true,
             default => false,
         };
     }
