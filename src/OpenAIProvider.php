@@ -183,9 +183,19 @@ final class OpenAIProvider implements ProviderInterface
      */
     private function buildChatPayload(array $messages, array $options = []): array
     {
+        $formattedMessages = $this->formatMessages($messages);
+
+        // Prepend system message if set in options
+        if (isset($options['system']) && !empty(trim($options['system']))) {
+            array_unshift($formattedMessages, [
+                'role' => 'system',
+                'content' => $options['system'],
+            ]);
+        }
+
         $payload = [
             'model' => $this->model,
-            'messages' => $this->formatMessages($messages),
+            'messages' => $formattedMessages,
         ];
 
         // Add optional parameters if provided
@@ -227,6 +237,46 @@ final class OpenAIProvider implements ProviderInterface
                     'content' => $message->content,
                 ];
 
+                if ($message->role->value === 'assistant') {
+                    // Try to decode as tool calls array
+                    $decoded = json_decode($message->content, true);
+                    if (is_array($decoded) && !empty($decoded)) {
+                        $toolCalls = [];
+                        $isToolCallMessage = false;
+
+                        foreach ($decoded as $item) {
+                            if (isset($item['id'], $item['function']['name'])) {
+                                // Raw OpenAI style
+                                $isToolCallMessage = true;
+                                $toolCalls[] = [
+                                    'id' => $item['id'],
+                                    'type' => 'function',
+                                    'function' => [
+                                        'name' => $item['function']['name'],
+                                        'arguments' => is_array($item['function']['arguments']) ? json_encode($item['function']['arguments']) : (string)$item['function']['arguments'],
+                                    ],
+                                ];
+                            } elseif (isset($item['id'], $item['name'])) {
+                                // Unified ToolCall style
+                                $isToolCallMessage = true;
+                                $toolCalls[] = [
+                                    'id' => $item['id'],
+                                    'type' => 'function',
+                                    'function' => [
+                                        'name' => $item['name'],
+                                        'arguments' => is_array($item['arguments']) ? json_encode($item['arguments']) : (string)$item['arguments'],
+                                    ],
+                                ];
+                            }
+                        }
+
+                        if ($isToolCallMessage) {
+                            $formatted['content'] = null;
+                            $formatted['tool_calls'] = $toolCalls;
+                        }
+                    }
+                }
+
                 if ($message->toolCallId) {
                     $formatted['tool_call_id'] = $message->toolCallId;
                 }
@@ -248,11 +298,12 @@ final class OpenAIProvider implements ProviderInterface
     private function formatTools(array $tools): array
     {
         return array_map(function ($tool) {
-            if (method_exists($tool, 'toArray')) {
-                return [
-                    'type' => 'function',
-                    'function' => $tool->toArray(),
-                ];
+            if (is_object($tool) && method_exists($tool, 'toArray')) {
+                return $tool->toArray();
+            }
+
+            if (is_array($tool) && isset($tool['type']) && $tool['type'] === 'function' && isset($tool['function'])) {
+                return $tool;
             }
 
             return [
